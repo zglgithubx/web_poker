@@ -25,3 +25,5 @@ go.work.sum
 .env
 
 front/node_modules/
+back_end/.idea/
+back_end/.vscode/
