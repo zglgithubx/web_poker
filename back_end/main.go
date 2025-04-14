@@ -24,12 +24,126 @@ func main() {
 
 type GameServer ds.GameServer
 
+var logger *log.Logger
 var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 }
 
+func NewGameServer() *GameServer {
+	gs := &GameServer{
+		Rooms: make(map[string]*ds.Room),
+		Lobby: make(chan *ds.Player),
+		Msg:   make(chan *ds.TransferMessage),
+	}
+	//匹配玩家
+	go gs.MatchPlayers()
+	//处理消息
+	go gs.HandleMessage()
+	logger = log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime|log.Lshortfile)
+	return gs
+}
+func (gs *GameServer) HandleConnections(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	connId := ut.GetUUID()
+	player := &ds.Player{Conn: ws, ID: connId}
+	gs.Lobby <- player
+	defer func(ws *websocket.Conn) {
+		err := ws.Close()
+		if err != nil {
+			logger.Println(err.Error())
+		}
+	}(ws)
+	for {
+		msgType, msg, err := ws.ReadMessage()
+		curRoomPlayers := gs.Rooms[player.RooId].Players
+		curRoomPlayersIndexIndex := gs.Rooms[player.RooId].PlayersIndex
+		logger.Println("当前用户信息:", player)
+		if err != nil || msgType == -1 {
+			delete(curRoomPlayers, connId)
+			delete(curRoomPlayersIndexIndex, connId)
+			gs.Rooms[player.RooId].Status = "waiting"
+			logger.Printf("当前玩家：%v,断开连接", player)
+			break
+		}
+		message := new(ds.TransferMessage)
+		unmarshelError := json.Unmarshal(msg, message)
+		if unmarshelError != nil {
+			logger.Printf("反序列化消息失败:%v", unmarshelError)
+			continue
+		}
+		fmt.Printf("%s 发送: %s,消息类型：%d\n", ws.RemoteAddr(), message, msgType)
+		if message.Type == "init" {
+			data := message.Data
+			playerID, ok1 := data["playerId"].(string)
+			playerName, ok2 := data["playerName"].(string)
+			if !ok1 || !ok2 {
+				logger.Println("Invalid player data")
+				continue
+			}
+			curRoomPlayers[connId].Name = playerName
+			curRoomPlayers[connId].UserId = playerID
+		} else {
+			gs.Msg <- message
+		}
+	}
+}
+func (gs *GameServer) MatchPlayers() {
+	for {
+		//匹配玩家
+		player := <-gs.Lobby
+		gs.Mutex.Lock()
+		hasRoom := false
+		responseMessage := ds.TransferMessage{
+			Data: make(map[string]any),
+		}
+		responseMessage.Type = "waiting"
+		responseMessage.Data["connId"] = player.ID
+		for _, room := range gs.Rooms {
+			if len(room.Players) < 3 && room.Status == "waiting" {
+				player.RooId = room.ID
+				room.Players[player.ID] = player
+				room.PlayersIndex[player.ID] = len(room.Players) + 1
+				// 房间满了，开始游戏
+				if len(room.Players) == 3 {
+					room.Status = "playing"
+					responseMessage.Type = "playing"
+					// 发牌
+					room.InitDeck()
+					//开始游戏
+					go room.StartGame()
+				}
+				gs.Mutex.Unlock()
+				hasRoom = true
+				ut.ResponseResult(player.Conn, responseMessage)
+				break
+			}
+		}
+		if !hasRoom {
+			// 创建新房间
+			newRoom := &ds.Room{
+				ID:                ut.GenerateRoomID(),
+				Status:            "waiting",
+				PlayersIndex:      make(map[string]int),
+				Players:           make(map[string]*ds.Player),
+				LastUserId:        "0",
+				LastCards:         make([]ds.Card, 0),
+				LastIsPass:        false,
+				CurSendCardUserId: "0",
+			}
+			player.RooId = newRoom.ID
+			newRoom.Players[player.ID] = player
+			newRoom.PlayersIndex[player.ID] = 1
+			gs.Rooms[newRoom.ID] = newRoom
+			gs.Mutex.Unlock()
+			ut.ResponseResult(player.Conn, responseMessage)
+		}
+	}
+}
 func (gs *GameServer) HandleMessage() {
 	for {
 		message := <-gs.Msg
@@ -185,121 +299,4 @@ func (gs *GameServer) HandleMessage() {
 			ut.ResponseResult(otherPlay.Conn, responseMsg)
 		}
 	}
-}
-
-func (gs *GameServer) HandleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	connId := ut.GetUUID()
-	player := &ds.Player{Conn: ws, ID: connId}
-	gs.Lobby <- player
-	defer func(ws *websocket.Conn) {
-		err := ws.Close()
-		if err != nil {
-			logger.Println(err.Error())
-		}
-	}(ws)
-	for {
-		msgType, msg, err := ws.ReadMessage()
-		curRoomPlayers := gs.Rooms[player.RooId].Players
-		curRoomPlayersIndexIndex := gs.Rooms[player.RooId].PlayersIndex
-		logger.Println("当前用户信息:", player)
-		if err != nil || msgType == -1 {
-			delete(curRoomPlayers, connId)
-			delete(curRoomPlayersIndexIndex, connId)
-			gs.Rooms[player.RooId].Status = "waiting"
-			logger.Printf("当前玩家：%v,断开连接", player)
-			break
-		}
-		message := new(ds.TransferMessage)
-		unmarshelError := json.Unmarshal(msg, message)
-		if unmarshelError != nil {
-			logger.Printf("反序列化消息失败:%v", unmarshelError)
-			continue
-		}
-		fmt.Printf("%s 发送: %s,消息类型：%d\n", ws.RemoteAddr(), message, msgType)
-		if message.Type == "init" {
-			data := message.Data
-			playerID, ok1 := data["playerId"].(string)
-			playerName, ok2 := data["playerName"].(string)
-			if !ok1 || !ok2 {
-				logger.Println("Invalid player data")
-				continue
-			}
-			curRoomPlayers[connId].Name = playerName
-			curRoomPlayers[connId].UserId = playerID
-		} else {
-			gs.Msg <- message
-		}
-	}
-}
-func (gs *GameServer) MatchPlayers() {
-	for {
-		//匹配玩家
-		player := <-gs.Lobby
-		gs.Mutex.Lock()
-		hasRoom := false
-		responseMessage := ds.TransferMessage{
-			Data: make(map[string]any),
-		}
-		responseMessage.Type = "waiting"
-		responseMessage.Data["connId"] = player.ID
-		for _, room := range gs.Rooms {
-			if len(room.Players) < 3 && room.Status == "waiting" {
-				player.RooId = room.ID
-				room.Players[player.ID] = player
-				room.PlayersIndex[player.ID] = len(room.Players) + 1
-				// 房间满了，开始游戏
-				if len(room.Players) == 3 {
-					room.Status = "playing"
-					responseMessage.Type = "playing"
-					// 发牌
-					room.InitDeck()
-					//开始游戏
-					go room.StartGame()
-				}
-				gs.Mutex.Unlock()
-				hasRoom = true
-				ut.ResponseResult(player.Conn, responseMessage)
-				break
-			}
-		}
-		if !hasRoom {
-			// 创建新房间
-			newRoom := &ds.Room{
-				ID:                ut.GenerateRoomID(),
-				Status:            "waiting",
-				PlayersIndex:      make(map[string]int),
-				Players:           make(map[string]*ds.Player),
-				LastUserId:        "0",
-				LastCards:         make([]ds.Card, 0),
-				LastIsPass:        false,
-				CurSendCardUserId: "0",
-			}
-			player.RooId = newRoom.ID
-			newRoom.Players[player.ID] = player
-			newRoom.PlayersIndex[player.ID] = 1
-			gs.Rooms[newRoom.ID] = newRoom
-			gs.Mutex.Unlock()
-			ut.ResponseResult(player.Conn, responseMessage)
-		}
-	}
-}
-
-var logger *log.Logger
-
-func NewGameServer() *GameServer {
-	gs := &GameServer{
-		Rooms: make(map[string]*ds.Room),
-		Lobby: make(chan *ds.Player),
-		Msg:   make(chan *ds.TransferMessage),
-	}
-	//匹配玩家
-	go gs.MatchPlayers()
-	//处理消息
-	go gs.HandleMessage()
-	logger = log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime|log.Lshortfile)
-	return gs
 }
